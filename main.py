@@ -108,7 +108,7 @@ async def create_incident(request: Request, db: Session = Depends(get_db)):
     
     try:
         completion = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gemini-1.5-flash",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"}
         )

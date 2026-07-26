@@ -1,7 +1,6 @@
 from sqlalchemy import create_engine, Column, String
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-# Initializes the SQLite database
 engine = create_engine("sqlite:///./incidents.db", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -11,6 +10,13 @@ class RunState(Base):
     run_id = Column(String, primary_key=True, index=True)
     request_hash = Column(String)
     status = Column(String)
+    state_json = Column(String)
+
+class ReceiptState(Base):
+    __tablename__ = "receipts"
+    receipt_id = Column(String, primary_key=True, index=True)
+    run_id = Column(String, index=True)
+    request_hash = Column(String)
     state_json = Column(String)
 
 Base.metadata.create_all(bind=engine)

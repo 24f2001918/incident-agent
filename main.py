@@ -2,18 +2,12 @@ import os
 import json
 import uuid
 import hashlib
+import urllib.request
 from fastapi import FastAPI, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 from database import get_db, RunState, ReceiptState
-from openai import OpenAI
 
 app = FastAPI()
-
-# Hardcode the Google AI Studio compatibility URL to prevent routing errors
-client = OpenAI(
-    api_key=os.environ.get("OPENAI_API_KEY"),
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
-)
 
 def generate_otlp_trace(run_id, public_marker, root_cause):
     trace_id = uuid.uuid4().hex
@@ -112,13 +106,27 @@ async def create_incident(request: Request, db: Session = Depends(get_db)):
     """
     
     try:
-        completion = client.chat.completions.create(
-            model="gemini-1.5-flash",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}
+        # Native direct call to Google Gemini bypassing the OpenAI SDK
+        api_key = os.environ.get("OPENAI_API_KEY")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+        
+        req_data = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json"}
+        }
+        
+        req = urllib.request.Request(
+            url, 
+            data=json.dumps(req_data).encode('utf-8'), 
+            headers={"Content-Type": "application/json"}
         )
-        ai_response = json.loads(completion.choices[0].message.content)
-        print("AI SUCCESS:", ai_response)
+        
+        with urllib.request.urlopen(req) as response:
+            result = json.loads(response.read().decode())
+            text_response = result["candidates"][0]["content"]["parts"][0]["text"]
+            ai_response = json.loads(text_response)
+            print("AI SUCCESS:", ai_response)
+            
     except Exception as e:
         print("AI ERROR:", str(e))
         ai_response = {

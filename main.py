@@ -8,7 +8,12 @@ from database import get_db, RunState, ReceiptState
 from openai import OpenAI
 
 app = FastAPI()
-client = OpenAI()
+
+# Hardcode the Google AI Studio compatibility URL to prevent routing errors
+client = OpenAI(
+    api_key=os.environ.get("OPENAI_API_KEY"),
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+)
 
 def generate_otlp_trace(run_id, public_marker, root_cause):
     trace_id = uuid.uuid4().hex
@@ -51,7 +56,7 @@ def generate_otlp_trace(run_id, public_marker, root_cause):
                             {"key": "ga5.run.id", "value": {"stringValue": run_id}},
                             {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
                             {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
-                            {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o-mini"}}
+                            {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-1.5-flash"}}
                         ]
                     }
                 ]

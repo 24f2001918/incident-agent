@@ -2,14 +2,12 @@ import os
 import json
 import uuid
 import hashlib
-from fastapi import FastAPI, Depends, HTTPException, Request, Response
+from fastapi import FastAPI, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
-from database import get_db, RunState
+from database import get_db, RunState, ReceiptState
 from openai import OpenAI
 
 app = FastAPI()
-
-# Automatically uses the OPENAI_API_KEY and OPENAI_BASE_URL from Render environment variables
 client = OpenAI()
 
 def generate_otlp_trace(run_id, public_marker, root_cause):
@@ -63,13 +61,14 @@ def generate_otlp_trace(run_id, public_marker, root_cause):
 
 @app.post("/v2/incidents")
 async def create_incident(request: Request, db: Session = Depends(get_db)):
-    body_bytes = await request.body()
-    body_hash = hashlib.sha256(body_bytes).hexdigest()
-    
     try:
-        body = json.loads(body_bytes)
+        body = await request.json()
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # 1. Create a stable hash to perfectly detect 409 Conflicts
+    canonical_body = json.dumps(body, sort_keys=True)
+    body_hash = hashlib.sha256(canonical_body.encode()).hexdigest()
 
     run_id = body.get("runId")
     public_marker = body.get("publicMarker", "default")
@@ -77,23 +76,37 @@ async def create_incident(request: Request, db: Session = Depends(get_db)):
     if body.get("profile") != "ga5-incident-agent/v2":
         raise HTTPException(status_code=400, detail="Invalid profile")
         
+    # 2. Check for Conflicts
     existing = db.query(RunState).filter(RunState.run_id == run_id).first()
     if existing:
         if existing.request_hash != body_hash:
-            return Response(status_code=409, content="Conflict")
+            raise HTTPException(status_code=409, detail="Changed content conflict")
         return json.loads(existing.state_json)
 
+    # 3. AI Processing
     incident = body.get("incident", {})
     transcript = incident.get("transcript", "")
     allowed_causes = incident.get("allowedRootCauses", [])
+    tool_catalog = body.get("toolCatalog", [])
 
     prompt = f"""
-    Analyze this incident transcript:
-    {transcript}
+    Transcript: {transcript}
+    Allowed Root Causes: {allowed_causes}
+    Tool Catalog: {json.dumps(tool_catalog)}
+
+    You are an AI diagnostic agent.
+    1. Select EXACTLY ONE root cause from the Allowed Root Causes.
+    2. Cite 2 to 4 evidence line IDs (e.g., "ev_123") from the Transcript.
+    3. Select ONE diagnostic tool from the Tool Catalog to verify this cause.
+    4. Determine the exact arguments needed for the tool based on the Transcript.
     
-    Choose EXACTLY ONE root cause from this list: {allowed_causes}.
-    Find 2 to 4 evidence line IDs from the transcript (e.g., ["ev_1", "ev_2"]).
-    Return ONLY a JSON object: {{"rootCause": "chosen_cause", "evidence": ["id1", "id2"]}}
+    Output strictly as JSON:
+    {{
+        "rootCause": "...",
+        "evidence": ["ev_...", "ev_..."],
+        "toolName": "...",
+        "arguments": {{...}}
+    }}
     """
     
     try:
@@ -104,7 +117,12 @@ async def create_incident(request: Request, db: Session = Depends(get_db)):
         )
         ai_response = json.loads(completion.choices[0].message.content)
     except Exception:
-        ai_response = {"rootCause": allowed_causes[0] if allowed_causes else "unknown", "evidence": []}
+        ai_response = {
+            "rootCause": allowed_causes[0] if allowed_causes else "unknown", 
+            "evidence": [],
+            "toolName": "query_metrics",
+            "arguments": {}
+        }
 
     otlp_trace, trace_id, parent_span = generate_otlp_trace(run_id, public_marker, ai_response.get("rootCause"))
 
@@ -115,13 +133,16 @@ async def create_incident(request: Request, db: Session = Depends(get_db)):
     response_data = {
         "runId": run_id,
         "status": "waiting",
-        "diagnosis": ai_response,
+        "diagnosis": {
+            "rootCause": ai_response.get("rootCause"),
+            "evidence": ai_response.get("evidence", [])
+        },
         "dispatches": [{
             "actionId": action_id,
             "callId": call_id,
             "phase": "diagnostic",
-            "toolName": "query_metrics", 
-            "arguments": {},
+            "toolName": ai_response.get("toolName"), 
+            "arguments": ai_response.get("arguments", {}),
             "evidence": ai_response.get("evidence", [])[:1],
             "attempt": 1,
             "traceparent": traceparent
@@ -136,10 +157,29 @@ async def create_incident(request: Request, db: Session = Depends(get_db)):
 
 @app.post("/v2/incidents/{runId}/receipts")
 async def process_receipt(runId: str, request: Request, db: Session = Depends(get_db)):
-    existing = db.query(RunState).filter(RunState.run_id == runId).first()
-    if not existing:
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    canonical_body = json.dumps(body, sort_keys=True)
+    body_hash = hashlib.sha256(canonical_body.encode()).hexdigest()
+    receipt_id = body.get("receiptId")
+
+    existing_receipt = db.query(ReceiptState).filter(ReceiptState.receipt_id == receipt_id).first()
+    if existing_receipt:
+        if existing_receipt.request_hash != body_hash:
+            raise HTTPException(status_code=409, detail="Changed receipt conflict")
+
+    existing_run = db.query(RunState).filter(RunState.run_id == runId).first()
+    if not existing_run:
         raise HTTPException(status_code=404, detail="Run not found")
-    return json.loads(existing.state_json)
+        
+    if not existing_receipt:
+        db.add(ReceiptState(receipt_id=receipt_id, run_id=runId, request_hash=body_hash, state_json=existing_run.state_json))
+        db.commit()
+
+    return json.loads(existing_run.state_json)
 
 @app.get("/v2/incidents/{runId}")
 async def get_incident(runId: str, db: Session = Depends(get_db)):
